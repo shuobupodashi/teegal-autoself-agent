@@ -45,8 +45,16 @@ function loadUpdateConfig(): string | null {
 /**
  * 🔥 获取当前生效的更新源 URL
  */
+/**
+ * 馃敟 瑙勮寖鍖栨洿鏂版簮 base URL锛氱‘淇濅互 / 缁撳熬
+ * electron-updater generic provider 浼氱敤 new URL('latest.yml', base) 鎷兼帴锛? * 鑻?base 鏃犲熬鏂滄潬浼氶€€鍖栨垚 /releases/latest/latest.yml -> 404
+ */
+function normalizeUpdateBaseUrl(url: string): string {
+  if (!url) return url;
+  return url.replace(/\/+$/, '') + '/';
+}
 function getEffectiveUpdateUrl(): string {
-  return customUpdateUrl || DEFAULT_OSS_UPDATES_URL;
+  return normalizeUpdateBaseUrl(customUpdateUrl || DEFAULT_OSS_UPDATES_URL);
 }
 
 /**
@@ -302,7 +310,7 @@ function setupIpcHandlers() {
   ipcMain.handle('updater:setSourceUrl', async (_event, url: string) => {
     try {
       const trimmedUrl = (url || '').trim();
-      customUpdateUrl = trimmedUrl || null;
+      customUpdateUrl = trimmedUrl ? normalizeUpdateBaseUrl(trimmedUrl) : null;
 
       // 持久化到配置文件
       const configPath = path.join(app.getPath('userData'), 'update-config.json');
