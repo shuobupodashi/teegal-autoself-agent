@@ -42,6 +42,8 @@ export interface ReActRoundRequest {
   toolResults?: Array<{
     toolName: string;
     parameters: Record<string, any>;
+    /** 🔥 真实轮号（executor push 时写入）：后端折叠行按真实轮号渲染，保证内容稳定 */
+    roundNumber?: number;
     result: {
       success: boolean;
       data?: any;

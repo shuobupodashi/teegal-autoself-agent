@@ -18,7 +18,7 @@ import {
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { ModelSettings } from '@/components/profile/ModelSettings';
 import { CredentialManager } from '@/components/workspace/auth/CredentialManager';
-import { isAutoImportEnabled, syncModelKeyCredentials } from '@/components/workspace/auth/modelKeySync';
+import { syncModelKeyCredentials } from '@/components/workspace/auth/modelKeySync';
 import { ModelManager } from '@/utils/llm/ModelManager';
 import { CloudAuthService } from '@/services/cloud/CloudAuthService';
 import { loadBaseProjectTools } from '@/utils/auto/BaseProjectToolLoader';
@@ -64,7 +64,7 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
   // 🔥 启动时静默同步模型密钥到凭据池（延迟等待登录/后端就绪，失败不打扰）
   useEffect(() => {
     const uid = userId || user?.id;
-    if (!uid || !isAutoImportEnabled()) return;
+    if (!uid) return;
     const timer = setTimeout(() => {
       syncModelKeyCredentials(String(uid)).catch(() => {});
     }, 2000);

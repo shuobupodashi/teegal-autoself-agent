@@ -345,10 +345,14 @@ return { success: true, data: { greeting: '你好，' + name } };
    - 云端按开机→关机时长自动结算扣费，关机即停止计费
    - ssh_instance(action='list') 随时查看活跃实例
 
+4. 自有服务器（用户自己的机器，不租云端）：ssh_instance(action='add', host='<IP>', username='<用户名>', password='<密码>')，port 默认 22
+   - 不计费、不经过云端账本；绑定前自动做连通测试并配公钥免密
+   - list 中显示为"自有机器（不计费）"；close 只解除与项目的绑定，机器本身不受影响
+
 ⚠️ 注意：
 - 与 run_project_oncloud（跑完即销毁）不同，SSH 实例从开机到关机持续计费，用完务必 close
 - 超过最长租期或余额不足时云端会自动关机`,
-    keywords: ["ssh", "ssh_instance", "云主机", "开机", "远程机器", "云服务器", "租用实例", "linux实例", "S5", "CPU实例", "远程操作", "远程开发"],
+    keywords: ["ssh", "ssh_instance", "云主机", "开机", "远程机器", "云服务器", "租用实例", "linux实例", "S5", "CPU实例", "远程操作", "远程开发", "自有机器", "自有服务器", "绑定服务器"],
     category: "platform"
   },
   {

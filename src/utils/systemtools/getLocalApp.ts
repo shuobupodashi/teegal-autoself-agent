@@ -12,12 +12,15 @@
  */
 
 import { desktopAppStorage, trainingTaskStorage } from '@/services/storage';
+import { resolveProjectId } from '@/utils/apptool/ProjectIdResolver';
+import { getAppBasePath } from '@/utils/apptool/AppPathHelper';
 
 export interface AppInfo {
   id: string;
   name: string;
   description?: string;
   activity?: string; // 🔥 活跃度摘要（最近训练/更新时间），帮 LLM 判断项目状态
+  localPath?: string; // 🔥 项目磁盘目录（LLM ssh 传文件/读代码直接用，不必从 id 推导）
 }
 
 export interface GetLocalAppResult {
@@ -43,11 +46,22 @@ const SPECIAL_QUERIES: Record<string, string> = {
 };
 
 /**
- * 验证 UUID 格式
+ * 🔥 长短 id 置换表：完整 id → 8 位短 id（LLM 交流习惯用短 id，与 read_project_file 等工具一致）
+ * 同批内前 8 位撞车时自动延长前缀，保证短 id 能唯一解析回完整 id
  */
-function isValidUUID(uuid: string): boolean {
-  const uuidRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
-  return uuidRegex.test(uuid.trim());
+function computeShortIds(ids: string[]): Map<string, string> {
+  const result = new Map<string, string>();
+  const assigned = new Set<string>();
+  for (const id of ids) {
+    let len = Math.min(8, id.length);
+    let sid = id.substring(0, len);
+    while (assigned.has(sid.toLowerCase()) && len < id.length) {
+      sid = id.substring(0, ++len);
+    }
+    assigned.add(sid.toLowerCase());
+    result.set(id, sid);
+  }
+  return result;
 }
 
 /**
@@ -165,46 +179,18 @@ export async function handleGetLocalApp(
     const allApps = await desktopAppStorage.getByUserId(userId, 100, 0, undefined, true);
     // 🔥 一次全量训练任务查询 → 内存按项目分组，生成活跃度摘要
     const trainMap = await buildTrainActivityMap(userId);
-    // 🔥 返回给 LLM 的 id 只取前8位，减少 token 消耗，且与 read_project_file 等工具的短 ID 支持一致
-    const mappedApps: AppInfo[] = allApps?.map((dbApp: any) => ({
-      id: dbApp.id.substring(0, 8),
+    // 🔥 长短 id 置换表：LLM 看到的 id 用短 id（省 token），localPath 用完整 id 解析真实磁盘目录
+    const shortIds = computeShortIds((allApps || []).map((a: any) => a.id));
+    const toAppInfo = async (dbApp: any): Promise<AppInfo> => ({
+      id: shortIds.get(dbApp.id) || dbApp.id.substring(0, 8),
       name: dbApp.name,
       description: dbApp.description,
       activity: buildActivity(dbApp.id, dbApp.updated_at, trainMap),
-    })) || [];
+      localPath: await getAppBasePath(dbApp.id).catch(() => undefined),
+    });
+    const mappedApps: AppInfo[] = await Promise.all((allApps || []).map(toAppInfo));
 
-    // 1. 🔥 如果 query 是有效的 UUID，精确匹配（匹配完整 UUID）
-    if (query && isValidUUID(query)) {
-      console.log('📱 [GET-LOCAL-APP] UUID精确匹配:', query);
-      const app = allApps?.find((a: any) => a.id === query.trim());
-      if (app) {
-        return {
-          success: true,
-          message: `找到应用: ${app.name}`,
-          appId: app.id.substring(0, 8),
-          apps: [{ id: app.id.substring(0, 8), name: app.name, description: app.description }],
-          source: 'appId',
-        };
-      }
-      // UUID 没命中，继续后续搜索
-    }
-
-    // 1.5 🔥 如果 query 是 8 位短 ID，在前 8 位中匹配
-    if (query && /^[a-f0-9]{8}$/i.test(query.trim())) {
-      console.log('📱 [GET-LOCAL-APP] 短ID匹配:', query);
-      const app = allApps?.find((a: any) => a.id.startsWith(query.trim()));
-      if (app) {
-        return {
-          success: true,
-          message: `找到应用: ${app.name}`,
-          appId: app.id.substring(0, 8),
-          apps: [{ id: app.id.substring(0, 8), name: app.name, description: app.description }],
-          source: 'appId',
-        };
-      }
-    }
-
-    // 2. 🔥 检查特殊查询（如"所有app"、"检查app"等）
+    // 1. 🔥 检查特殊查询（如"所有app"、"检查app"等）
     const specialAction = checkSpecialQuery(query);
     if (specialAction === 'list_all' || !query) {
       console.log('📱 [GET-LOCAL-APP] 返回所有应用');
@@ -225,6 +211,26 @@ export async function handleGetLocalApp(
         apps: mappedApps.slice(0, 20),
         source: 'list',
       };
+    }
+
+    // 2. 🔥 长短 id 置换：完整 UUID / 8 位短 id / slug（如 base-boo → base-bootcode）统一查库解析
+    if (query) {
+      const resolved = { id: '' };
+      const resolveErr = await resolveProjectId(query, resolved, userId);
+      if (!resolveErr) {
+        const app = allApps?.find((a: any) => a.id === resolved.id);
+        if (app) {
+          console.log('📱 [GET-LOCAL-APP] id 解析命中:', query, '→', app.id);
+          return {
+            success: true,
+            message: `找到应用: ${app.name}`,
+            appId: shortIds.get(app.id) || app.id.substring(0, 8),
+            apps: [await toAppInfo(app)],
+            source: 'appId',
+          };
+        }
+      }
+      // 解析失败（含多义前缀）→ 落到关键词搜索兜底
     }
 
     // 3. 🔥 使用 query 作为关键词搜索

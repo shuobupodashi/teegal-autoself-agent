@@ -16,6 +16,7 @@
 
 import { AutoStep, AutoToolResult } from '@/utils/auto/types';
 import { CloudAuthService } from '@/services/cloud/CloudAuthService';
+import { resolveProjectId, isSameProjectId } from '@/utils/apptool/ProjectIdResolver';
 import { getBackendUrl } from '@/config/env';
 import { executeExecuteCommandTool, ExecuteCommandProgress } from './executeCommand';
 
@@ -257,15 +258,16 @@ async function plinkExec(
   user: string,
   credentialName: string,
   command: string,
-  userId?: string
+  userId?: string,
+  port: number = 22
 ): Promise<{ out: string; fingerprint?: string; err?: string }> {
-  const base = `${PLINK_PATH} -ssh -batch -pw $env:SSHPASS ${user}@${host}`.replace(/\s+/g, ' ');
+  const base = `${PLINK_PATH} -ssh -P ${port} -batch -pw $env:SSHPASS ${user}@${host}`.replace(/\s+/g, ' ');
   // 🔥 2>&1 必须带：-batch 的 "host key is not cached" 错误（含指纹）走 stderr，不合并就拿不到指纹
   const r1 = await runLocalShellDetailed(`${base} "${command}" 2>&1`, userId, credentialName);
   let out = r1.out;
   const fp = out.match(/SHA256:[A-Za-z0-9+/=]+/);
   if (fp && /host key is not cached/i.test(out)) {
-    const r2 = await runLocalShellDetailed(`${PLINK_PATH} -ssh -batch -hostkey "${fp[0]}" -pw $env:SSHPASS ${user}@${host} "${command}" 2>&1`.replace(/\s+/g, ' '), userId, credentialName);
+    const r2 = await runLocalShellDetailed(`${PLINK_PATH} -ssh -P ${port} -batch -hostkey "${fp[0]}" -pw $env:SSHPASS ${user}@${host} "${command}" 2>&1`.replace(/\s+/g, ' '), userId, credentialName);
     return { out: r2.out, fingerprint: fp[0], err: r2.err };
   }
   return { out, err: r1.err };
@@ -281,7 +283,8 @@ async function injectPublicKeyViaPlink(
   user: string,
   credentialName: string,
   fingerprint: string | undefined,
-  userId?: string
+  userId?: string,
+  port: number = 22
 ): Promise<{ ok: boolean; out: string; err?: string }> {
   // 确保本地公钥文件存在（必要时生成）
   const local = await resolveLocalPublicKey(userId);
@@ -291,7 +294,7 @@ async function injectPublicKeyViaPlink(
   // 🔥 cmd /c + < 重定向 stdin（实测成功的唯一形态：INJECT_OK + 免密打通）。
   //    PowerShell 管道（Get-Content | plink）会让 plink 参数解析失败（Host does not exist），
   //    公钥文本嵌命令行又会被引号转义破坏——公钥必须走文件重定向。
-  const cmd = `cmd /c '%USERPROFILE%\\.teegal\\bin\\plink.exe -ssh -batch${hostArg} -pw %SSHPASS% ${user}@${host} "cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && echo INJECT_OK" < ${local.pubPath}'`;
+  const cmd = `cmd /c '%USERPROFILE%\\.teegal\\bin\\plink.exe -ssh -P ${port} -batch${hostArg} -pw %SSHPASS% ${user}@${host} "cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && echo INJECT_OK" < ${local.pubPath}'`;
   const r = await runLocalShellDetailed(cmd.replace(/\s+/g, ' '), userId, credentialName);
   return { ok: r.ok && r.out.includes('INJECT_OK'), out: r.out, err: r.err };
 }
@@ -305,19 +308,22 @@ async function probeSshReady(
   host: string,
   user: string,
   credentialName: string | null,
-  userId?: string
+  userId?: string,
+  maxAttempts: number = 8,
+  port: number = 22
 ): Promise<{ ready: boolean; authMode: 'key' | 'password' | 'none'; fingerprint?: string; diag?: string }> {
   const idArg = sshIdentityArg();
-  const cmd = `ssh ${idArg} -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no ${user}@${host} 'echo ok'`.replace(/\s+/g, ' ');
-  // 公钥探测：最多 ~90s（首次启动初始化通常 30-60s）
-  for (let i = 0; i < 8; i++) {
+  const portArg = port !== 22 ? ` -p ${port}` : '';
+  const cmd = `ssh ${idArg}${portArg} -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no ${user}@${host} 'echo ok'`.replace(/\s+/g, ' ');
+  // 公钥探测：最多 ~90s（首次启动初始化通常 30-60s）；自有机器传 maxAttempts=1（机器是活的）
+  for (let i = 0; i < maxAttempts; i++) {
     const out = await runLocalShell(cmd, userId);
     if (out.includes('ok')) return { ready: true, authMode: 'key' };
     await new Promise(r => setTimeout(r, 10000));
   }
   // 🔥 公钥失败：ssh -v 诊断（本地私钥是否被 ssh 看到）
-  const dbg = await runLocalShell(`ssh ${idArg} -v -o BatchMode=yes -o ConnectTimeout=10 ${user}@${host} exit 2>&1`.replace(/\s+/g, ' '), userId);
-  const timedOut = /Connection timed out|connect to host .* port 22/i.test(dbg);
+  const dbg = await runLocalShell(`ssh ${idArg}${portArg} -v -o BatchMode=yes -o ConnectTimeout=10 ${user}@${host} exit 2>&1`.replace(/\s+/g, ' '), userId);
+  const timedOut = /Connection timed out|connect to host/i.test(dbg) && new RegExp(`port ${port}`).test(dbg);
   const keyLines = dbg.split('\n').filter(l =>
     /identity file|Trying private key|no such identity|Permission denied|Authentications that can continue|Connection timed out|port 22/i.test(l)
   ).slice(0, 6);
@@ -330,7 +336,7 @@ async function probeSshReady(
   if (credentialName && navigator.userAgent.includes('Windows')) {
     const plinkOk = await ensurePlink(userId);
     if (plinkOk) {
-      const pr = await plinkExec(host, user, credentialName, 'echo ok', userId);
+      const pr = await plinkExec(host, user, credentialName, 'echo ok', userId, port);
       const passwordReady = pr.out.includes('ok');
       plinkDiag = passwordReady
         ? '[plink 密码通道可用]'
@@ -339,7 +345,7 @@ async function probeSshReady(
       // 🔥 公钥自愈：只要密码通道可达（或拿到指纹），就现场注入本地公钥 → 收敛到免密 key 模式
       //    （服务端 authorized_keys 为空是常态——cloud-init 注入不可靠，靠本地自救）
       if (passwordReady || pr.fingerprint) {
-        const inj = await injectPublicKeyViaPlink(host, user, credentialName, pr.fingerprint, userId);
+        const inj = await injectPublicKeyViaPlink(host, user, credentialName, pr.fingerprint, userId, port);
         if (inj.ok) {
           for (let i = 0; i < 2; i++) {
             const out2 = await runLocalShell(cmd, userId);
@@ -422,8 +428,18 @@ export interface SshOpenResult {
  * 复用检查：本项目专属的机子优先；其他项目专属的不复用（防跨项目干扰）；未绑定归属的可复用。
  */
 export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResult> {
-  const { instanceType, projectId, userId, onProgress, resumeInstanceId } = opts;
-  if (!instanceType) {
+  const { instanceType, userId, onProgress, resumeInstanceId } = opts;
+  // 🔥 长短 id 置换：短 id/slug 统一解析为完整 id 再登记（UI 按完整 id 比对归属指示灯）
+  let projectId: string | undefined;
+  if (opts.projectId) {
+    const resolved = { id: '' };
+    const resolveErr = await resolveProjectId(opts.projectId, resolved, userId);
+    if (resolveErr) {
+      return { ok: false, error: `projectId 无法解析：${resolveErr}` };
+    }
+    projectId = resolved.id;
+  }
+  if (!instanceType && !resumeInstanceId) {
     return { ok: false, error: '缺少 instanceType（如 S5.MEDIUM4，可用 list_instance_types 查询规格）' };
   }
 
@@ -440,6 +456,16 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
     }
     target = inst;
     reused = true;
+    // 🔥 复用凭据名从本地记录补齐（云端详情不回传密码，凭据早已入库无需重建）
+    const lr = await localApi(`/api/rental/resources?userId=${encodeURIComponent(userId || '')}`)
+      .catch(() => ({ ok: false, status: 0, data: null }));
+    const localRec = (lr.data?.resources || []).find((x: any) =>
+      x.cloud_rental_id === resumeInstanceId || x.cloud_instance_id === resumeInstanceId
+    );
+    if (localRec?.credential_name) {
+      target.ssh_password = undefined; // 无新密码，保留下方 null 逻辑
+      (target as any)._localCredentialName = localRec.credential_name;
+    }
   } else {
     onProgress?.('检查可复用的活跃实例...');
     const localRes = await localApi(
@@ -447,7 +473,8 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
     ).catch(() => ({ ok: false, status: 0, data: null }));
     const localActives: any[] = localRes.data?.resources || [];
     const boundToOther = new Set(
-      localActives.filter(r => r.app_id && r.app_id !== projectId).map(r => r.cloud_rental_id || r.cloud_instance_id)
+      // 🔥 长短 id 兼容比对：存量记录可能登记短 id
+      localActives.filter(r => r.app_id && !isSameProjectId(r.app_id, projectId)).map(r => r.cloud_rental_id || r.cloud_instance_id)
     );
 
     const listRes = await rentalApi('/instances?active=1');
@@ -500,10 +527,10 @@ export async function sshOpenInstance(opts: SshOpenOptions): Promise<SshOpenResu
     target = waited.instance;
   }
 
-  // 4. 密码凭据自动入库
+  // 4. 密码凭据自动入库（复用路径无新密码 → 沿用本地记录里的凭据名）
   const credentialName = target.ssh_password
     ? await saveCredential(target.instance_id, target.ssh_password, userId)
-    : null;
+    : ((target as any)._localCredentialName || null);
 
   // 5. 🔥 就绪信息回写本地资源表（IP/实例ID/凭据名/running）——否则本地表永远停在 booting
   if (localResourceId) {
@@ -551,15 +578,148 @@ export async function sshListActive(
   return { ok: true, instances: res.data?.resources || [] };
 }
 
-/** 关机结算（云端扣费 + 本地表收尾 + 凭据同步删除） */
+/** 自有机器凭据入库（密码只进凭据库，不经任何后端；存在则更新） */
+async function upsertSelfCredential(
+  name: string,
+  host: string,
+  username: string,
+  password: string,
+  userId?: string
+): Promise<boolean> {
+  try {
+    const electron = (window as any).electron;
+    if (!electron?.localStorage?.getCredentialByName || !userId) {
+      console.warn('[SSH-INSTANCE] 自有机器凭据入库跳过: 缺少凭据 API 或 userId');
+      return false;
+    }
+    const existing = await electron.localStorage.getCredentialByName(name, userId);
+    if (existing?.id) {
+      const r = await electron.localStorage.updateCredential(existing.id, { value: password });
+      return !(r && r.success === false);
+    }
+    const r = await electron.localStorage.createCredential({
+      userId,
+      name,
+      type: 'env',
+      description: `自有机器 ${username}@${host} SSH 密码（sshpass -e / plink 兜底用，优先公钥免密）`,
+      envVar: 'SSHPASS',
+      value: password,
+    });
+    return !!r?.success;
+  } catch (error) {
+    console.warn('[SSH-INSTANCE] 自有机器凭据入库失败:', error);
+    return false;
+  }
+}
+
+/** 自有机器操作选项 */
+export interface SshAddSelfOptions {
+  host: string;
+  port?: number;
+  username: string;
+  password: string;
+  /** 自定义凭据名（默认自动生成 ssh_self-xxx） */
+  credentialName?: string;
+  /** 登记项目归属（本地表 app_id） */
+  projectId?: string;
+  userId?: string;
+  onProgress?: (msg: string) => void;
+}
+
+/**
+ * 添加自有机器（用户自己的服务器）：连通测试（顺带自动配公钥免密）→ 凭据入库 → 本地建档。
+ * 不经过云端账本：不计费、不参与对账；"close"只解绑（机器本身不受影响）。
+ */
+export async function sshAddSelfInstance(
+  opts: SshAddSelfOptions
+): Promise<SshOpenResult & { resourceId?: string }> {
+  const { host, username, password, userId, onProgress } = opts;
+  // 🔥 长短 id 置换：与 sshOpenInstance 同规则，登记完整 id
+  let projectId: string | undefined;
+  if (opts.projectId) {
+    const resolved = { id: '' };
+    const resolveErr = await resolveProjectId(opts.projectId, resolved, userId);
+    if (resolveErr) {
+      return { ok: false, error: `projectId 无法解析：${resolveErr}` };
+    }
+    projectId = resolved.id;
+  }
+  const port = opts.port || 22;
+  if (!host || !username || !password) {
+    return { ok: false, error: '缺少 host / username / password' };
+  }
+
+  // 1. 凭据先入库（连通测试的 plink 通道依赖凭据名注入 SSHPASS；失败/重复绑定会回滚）
+  const credName = (opts.credentialName || `ssh_self-${Date.now().toString(36)}`).trim();
+  onProgress?.('保存凭据...');
+  if (!(await upsertSelfCredential(credName, host, username, password, userId))) {
+    return { ok: false, error: '凭据保存失败（见 DevTools console 的 [SSH-INSTANCE] 日志）' };
+  }
+
+  // 2. 连通性测试（自有机器是活的，1 次探测即可；公钥注入自愈同样适用）
+  onProgress?.(`测试连接 ${username}@${host}:${port}...`);
+  const probe = await probeSshReady(host, username, credName, userId, 1, port);
+  if (!probe.ready) {
+    await deleteCredentialByInstance(credName, userId);
+    return {
+      ok: false,
+      error: `连接测试未通过：${probe.diag || '检查地址/端口/用户名/密码，以及服务器防火墙是否放行该端口'}`,
+    };
+  }
+
+  // 3. 本地建档（source=workstation，不过云端账本）
+  onProgress?.('登记自有机器...');
+  const addRes = await localApi('/api/rental/resources/self', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      userId,
+      appId: projectId || undefined,
+      host,
+      port,
+      username,
+      credentialName: credName,
+    }),
+  });
+  if (!addRes.ok || !addRes.data?.success) {
+    await deleteCredentialByInstance(credName, userId);
+    return { ok: false, error: addRes.data?.error || `本地登记失败 (HTTP ${addRes.status})` };
+  }
+  if (addRes.data?.duplicated) {
+    await deleteCredentialByInstance(credName, userId);
+    return { ok: false, error: '该机器已在常驻列表中，未重复添加' };
+  }
+
+  return {
+    ok: true,
+    resourceId: addRes.data?.resourceId,
+    credentialName: credName,
+    sshReady: probe.ready,
+    authMode: probe.authMode,
+    plinkFingerprint: probe.fingerprint,
+    probeDiag: probe.diag,
+    instance: {
+      id: addRes.data?.resourceId,
+      instance_id: 'self',
+      instance_type: 'self',
+      public_ip: host,
+      ssh_user: username,
+      price_per_hour: 0,
+    },
+  };
+}
+
+/** 关机结算（云端扣费 + 本地表收尾 + 凭据同步删除）；自有机器只解绑 */
 export async function sshCloseInstance(
   instanceId: string,
   userId?: string
-): Promise<{ ok: boolean; rentalId?: string; error?: string }> {
-  // 🔥 关机前先从本地资源表取底层 instanceId / 凭据名
+): Promise<{ ok: boolean; rentalId?: string; unbound?: boolean; error?: string }> {
+  // 🔥 关机前先从本地资源表取底层 instanceId / 凭据名 / 来源
   // （LLM 关机传的可能是 rentalId rent-xxx，而凭据名按底层实例 ID 命名 ssh_ins-xxx，直接删会扑空）
   let cloudInstanceId = '';
   let credentialName = '';
+  let localId = '';
+  let source = 'cloud';
   const lr = await localApi(`/api/rental/resources?userId=${encodeURIComponent(userId || '')}`)
     .catch(() => ({ ok: false, status: 0, data: null }));
   if (lr.ok) {
@@ -569,7 +729,25 @@ export async function sshCloseInstance(
     if (rec) {
       cloudInstanceId = rec.cloud_instance_id || '';
       credentialName = rec.credential_name || '';
+      localId = rec.id || '';
+      source = rec.source || 'cloud';
     }
+  }
+
+  // 🔥 自有机器：只解绑（机器本身不受影响、不计费，绝不能调云端 API），凭据同步清除不留僵尸
+  if (source === 'workstation') {
+    if (!localId) return { ok: false, error: `本地记录不存在: ${instanceId}` };
+    const r = await localApi(`/api/rental/resources/${encodeURIComponent(localId)}/unbind`, {
+      method: 'POST',
+    });
+    if (!r.ok || !r.data?.success) {
+      return { ok: false, error: r.data?.error || `解绑失败 (HTTP ${r.status})` };
+    }
+    // 解绑后凭据（存着服务器密码）一并删除；重新绑定时会重新入库
+    if (credentialName) {
+      await deleteCredentialByInstance(credentialName, userId);
+    }
+    return { ok: true, unbound: true };
   }
 
   const res = await rentalApi(`/instances/${encodeURIComponent(instanceId)}/close`, {
@@ -624,9 +802,35 @@ function usageHint(inst: any, credentialName: string | null, authMode?: 'key' | 
   return hint;
 }
 
+/** 自有机器的使用提示（不计费；close 只解绑） */
+function selfUsageHint(inst: any, credentialName: string | null, authMode?: 'key' | 'password' | 'none', fingerprint?: string): string[] {
+  const ip = inst.public_ip || inst.host;
+  const user = inst.ssh_user || inst.username || 'root';
+  const port = Number(inst.port) || 22;
+  const portArg = port !== 22 ? ` -p ${port}` : '';
+  const hint = [
+    `✅ 自有机器已就绪: ${inst.instance_type || 'self'} @ ${ip}:${port}`,
+    `   记录ID: ${inst.id || inst.resourceId} | 登录用户: ${user} | 来源: 用户自有（不计费）`,
+    `   凭据名: ${credentialName || '（未设置）'}`,
+  ];
+  if (authMode === 'password') {
+    hint.push(`   ⚠️ 公钥免密未生效，走 plink 密码通道。用 userpc_shell 执行（传 credentialName=${credentialName} 注入 SSHPASS）:`);
+    hint.push(`   & "$env:USERPROFILE\\.teegal\\bin\\plink.exe" -ssh -P ${port} -batch${fingerprint ? ` -hostkey "${fingerprint}"` : ''} -pw $env:SSHPASS ${user}@${ip} "命令"`.replace(/\s+/g, ' '));
+  } else {
+    const idArg = sshIdentityArg();
+    hint.push(`   现在用 userpc_shell 执行: ssh ${idArg}${portArg} -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no ${user}@${ip} '命令'`.replace(/\s+/g, ' '));
+  }
+  hint.push(`   （需要 root 权限时用: ${user}@${ip} 'sudo -i' 或 'sudo 命令'）`);
+  if (authMode !== 'password' && credentialName) {
+    hint.push(`   （密码兜底，macOS/Linux）: userpc_shell 传 credentialName=${credentialName}, command='sshpass -e ssh${portArg} -o StrictHostKeyChecking=no ${user}@${ip} 命令'`);
+  }
+  hint.push(`   该机器由用户自有维护，不产生平台计费；用 action=close, instanceId=${inst.id || inst.resourceId} 只解除项目绑定（机器不受影响）`);
+  return hint;
+}
+
 /**
  * ssh_instance 工具执行入口
- * action: activate（开机/复用）| close（关机结算）| list（活跃实例清单）
+ * action: activate（开机/复用）| add（绑定自有服务器）| close（关机/解绑）| list（活跃实例清单）
  */
 export async function executeSshInstanceTool(
   step: AutoStep,
@@ -645,39 +849,84 @@ export async function executeSshInstanceTool(
       return ok(['当前没有活跃的常驻实例。用 action=activate + instanceType 开机']);
     }
     const lines = r.instances.map((r: any) =>
-      `- ${r.cloud_rental_id || r.cloud_instance_id} | ${r.instance_type} | ${r.status} | IP: ${r.host || '分配中'} | 登录用户: ${r.username || r.ssh_user || 'ubuntu'} | 项目: ${r.app_id || '（未绑定）'} | 凭据: ${r.credential_name || `ssh_${r.cloud_instance_id}`}`
+      r.source === 'workstation'
+        ? `- ${r.id} | 自有机器（不计费） | ${r.instance_type} | ${r.status} | ${r.username || 'root'}@${r.host || '?'}:${r.port || 22} | 项目: ${r.app_id || '（未绑定）'} | 凭据: ${r.credential_name || '（未设置）'}`
+        : `- ${r.cloud_rental_id || r.cloud_instance_id} | ${r.instance_type} | ${r.status} | IP: ${r.host || '分配中'} | 登录用户: ${r.username || r.ssh_user || 'ubuntu'} | 项目: ${r.app_id || '（未绑定）'} | 凭据: ${r.credential_name || `ssh_${r.cloud_instance_id}`}`
     );
     return ok([
       `活跃常驻实例 ${r.instances.length} 台（按项目归属区分，root 权限用 sudo -i）:`,
       ...lines,
       `凭据用法: userpc_shell 传 credentialName=凭据名 即自动登录对应机子；代码/脚本里引用该凭据名会自动替换成密码`,
+      `绑定用户自有服务器: action=add + host/port/username/password（连通测试通过后自动配公钥免密并登记，不计费）`,
     ]);
   }
 
-  // ---------- close：关机结算 ----------
+  // ---------- close：关机结算（自有机器=解绑） ----------
   if (action === 'close') {
     const instanceId = String(params.instanceId || '').trim();
     if (!instanceId) return fail('缺少 instanceId（可用 action=list 先查询）');
     const r = await sshCloseInstance(instanceId, context?.userId);
     if (!r.ok) return fail(r.error || '关机失败');
+    if (r.unbound) {
+      return ok([`✅ 自有机器已解除绑定（机器本身不受影响，不计费，凭据已同步清除；需要时重新添加即可）`]);
+    }
     return ok([`✅ 实例 ${r.rentalId} 已关机，云端已按时长结算扣费（对应凭据已清理）`]);
   }
 
-  // ---------- activate：开机（或复用） ----------
+  // ---------- add：绑定用户自有服务器（不计费、不过云端账本） ----------
+  if (action === 'add') {
+    const host = String(params.host || '').trim();
+    const username = String(params.username || 'root').trim();
+    const password = String(params.password || '').trim();
+    const port = Number(params.port || 22) || 22;
+    if (!host || !password) {
+      return fail('缺少 host 或 password（自有服务器地址与密码请向用户确认后传入）');
+    }
+    const r = await sshAddSelfInstance({
+      host,
+      port,
+      username,
+      password,
+      projectId: String(params.projectId || '').trim() || undefined,
+      userId: context?.userId,
+    });
+    if (!r.ok) return fail(r.error || '添加失败');
+    const hint = selfUsageHint(r.instance, r.credentialName ?? null, r.authMode, r.plinkFingerprint);
+    hint.unshift(`sshReady=${r.sshReady} | authMode=${r.authMode ?? 'unknown'} | credentialName=${r.credentialName || '（入库失败）'}${r.plinkFingerprint ? ` | hostkey=${r.plinkFingerprint}` : ''}`);
+    return ok(hint);
+  }
+
+  // ---------- activate：开机（或复用；instanceId 命中自有机器直接复用） ----------
   if (action !== 'activate') {
-    return fail(`未知 action: ${action}（支持 activate | close | list）`);
+    return fail(`未知 action: ${action}（支持 activate | add | close | list）`);
   }
 
   const instanceId = String(params.instanceId || '').trim();
-  const instanceType = String(params.instanceType || '').trim() || (instanceId ? '' : '');
-  if (!instanceType) {
-    return fail('缺少 instanceType（如 S5.MEDIUM4，可用 list_instance_types 查询规格）');
+  const instanceType = String(params.instanceType || '').trim();
+  if (!instanceType && !instanceId) {
+    return fail('缺少 instanceType（如 S5.MEDIUM4，可用 list_instance_types 查询规格），或传 instanceId 复用已有实例（可用 action=list 查询）');
+  }
+
+  // 🔥 自有机器复用：instanceId 命中本地 workstation 活跃记录 → 直接返回（不查云端）
+  if (instanceId) {
+    const lr = await localApi(`/api/rental/resources?userId=${encodeURIComponent(context?.userId || '')}`)
+      .catch(() => ({ ok: false, status: 0, data: null }));
+    const rec = (lr.data?.resources || []).find((x: any) => x.id === instanceId && x.source === 'workstation');
+    if (rec && (rec.status === 'booting' || rec.status === 'running')) {
+      const hint = selfUsageHint(rec, rec.credential_name || null);
+      hint.unshift(`sshReady=true | authMode=reused(自有机器) | credentialName=${rec.credential_name || '（未设置）'}`);
+      return ok(hint);
+    }
+    if (rec) {
+      return fail(`自有机器 ${instanceId} 已解除绑定，请用 action=add 重新添加`);
+    }
   }
 
   const r = await sshOpenInstance({
     instanceType,
     projectId: String(params.projectId || '').trim() || undefined,
     userId: context?.userId,
+    resumeInstanceId: instanceId || undefined,
   });
   if (!r.ok) return fail(r.error || '开机失败');
 

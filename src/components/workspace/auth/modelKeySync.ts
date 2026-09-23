@@ -1,20 +1,18 @@
 /**
  * 模型密钥自动同步（轻量镜像同步）
  *
- * 🔥 设计：开关制，不维护"删除屏蔽表"
- * - 开（默认）：凭据池镜像「我的模型」中带 API Key 的模型 + 「搜索源」中带 API Key 的搜索源（增/改/删跟随）
- * - 关：完全手工维护（CredentialManager 的「从模型导入」按钮）
- * - 用户不想让某个 key 进池子 → 关掉自动导入再删除即可，不会再回来
+ * 🔥 设计：始终同步，无开关
+ * - 凭据池镜像「我的模型」中带 API Key 的模型 + 「搜索源」中带 API Key 的搜索源（增/改/删跟随）
+ * - 想移除某个 key → 到模型/搜索源管理里删掉对应 key 即可，凭据会自动跟着移除
  *
  * 🔥 同步标记：描述末尾带「（自动同步）」的 env 凭据归本模块管理；
- *    手工创建/导入的凭据（无标记）永远不碰。
+ *    手工创建的凭据（无标记）永远不碰。
  *    - 模型：「模型 {modelId} 的 API Key（自动同步）」
  *    - 搜索源：「搜索源 {name} 的 API Key（自动同步）」
  */
 
 import { ModelManager } from '@/utils/llm/ModelManager';
 
-const LS_KEY = 'teegal.autoImportModelKeys';
 const SYNC_MARK = '（自动同步）';
 const SYNC_DESC_RE = /^模型 (.+?) 的 API Key（自动同步）/;
 const SEARCH_SYNC_DESC_RE = /^搜索源 (.+?) 的 API Key（自动同步）/;
@@ -64,23 +62,6 @@ export function suggestSearchEnvVarName(providerType: string, url: string, name:
   }
   const slug = (name || 'SEARCH').toUpperCase().replace(/[^A-Z0-9]+/g, '_');
   return `SEARCH_${slug}_KEY`;
-}
-
-/** 自动导入是否开启（默认开启） */
-export function isAutoImportEnabled(): boolean {
-  try {
-    return localStorage.getItem(LS_KEY) !== '0';
-  } catch {
-    return true;
-  }
-}
-
-export function setAutoImportEnabled(enabled: boolean): void {
-  try {
-    localStorage.setItem(LS_KEY, enabled ? '1' : '0');
-  } catch {
-    // localStorage 不可用时静默忽略（保持内存默认值）
-  }
 }
 
 export interface SyncResult {

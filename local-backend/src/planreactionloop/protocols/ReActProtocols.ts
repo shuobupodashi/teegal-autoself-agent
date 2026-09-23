@@ -97,7 +97,7 @@ function parseNotesByRound(writeNotes?: string): Map<number, string> {
 /**
  * 🔥 构建执行历史文本（按 Round 堆叠，笔记和执行记录内聚，优化缓存命中率）
  * 截断/折叠逻辑统一在此处理：
- * - clearWindow 外的旧轮次折叠为一行摘要
+ * - clearWindow 外的旧轮次折叠为一行摘要（折叠边界按批次移动，两次移动之间历史纯追加，保住缓存前缀）
  * - 窗口内超大结果按单条上限截断
  * - 🔥 动态防护：历史总体积超预算时自动缩小 clearWindow 直到达标；缩到 1 仍超则收紧单条截断兜底
  * @param clearWindow 期望保留完整结果的轮数（从 ReActService.ts 传入）
@@ -107,6 +107,8 @@ function parseNotesByRound(writeNotes?: string): Map<number, string> {
 interface ToolResultItem {
   toolName: string;
   parameters: Record<string, any>;
+  /** 🔥 真实轮号（executor push 时写入）：折叠行内容只由条目自身决定，历史窗口平移后内容仍不变 */
+  roundNumber?: number;
   result: {
     success: boolean;
     data?: any;
@@ -123,11 +125,15 @@ function renderRounds(
   clearWindow: number,
   maxResultChars: number
 ): string {
-  const startIndex = Math.max(0, toolResults.length - clearWindow);
+  // 🔥 缓存友好：折叠边界按批次移动（而非每轮 +1），两次移动之间历史纯追加，保住 prompt 前缀缓存
+  const BATCH = Math.max(1, Math.floor(clearWindow / 2));
+  const overflow = Math.max(0, toolResults.length - clearWindow);
+  const startIndex = Math.floor(overflow / BATCH) * BATCH;
 
   return toolResults
     .map((tool, index) => {
-      const roundNum = index + 1;
+      // 🔥 优先用真实轮号：不用 index 重编号，避免历史窗口平移后折叠行内容每轮变化
+      const roundNum = tool.roundNumber ?? index + 1;
       const paramsStr = tool.parameters?.query
         ? `"${tool.parameters.query}"`
         : JSON.stringify(tool.parameters || {}).substring(0, 100);
@@ -197,18 +203,20 @@ function buildExecutionHistory(
 
   let header = '';
   if (toolResults.length) {
-    // 🔥 header 中不包含动态数字（如 totalRounds），避免每轮 header 变化打断缓存前缀
-    header = `执行历史（仅保留最近 ${effectiveWindow} 轮完整结果，请勤快记录笔记防止重要内容丢失）:\n`;
+    // 🔥 header 固定写 clearWindow 配置值（不用 effectiveWindow 动态数字），保证 header 每轮完全一致
+    header = `执行历史（仅保留最近 ${clearWindow} 轮完整结果，请勤快记录笔记防止重要内容丢失）:\n`;
   }
 
   // 🔥 防护触发时告知 LLM 原因与建议，引导其缩小读取范围
+  // 🔥 放在历史末尾而非 header：即使出现/消失也只在末段打断缓存，不影响前面的前缀命中
+  let footer = '';
   if (compressed) {
-    header += `⚠️ 注意：近期工具返回内容体积过大（超出预算 ${maxHistoryChars} 字符），已自动将完整结果窗口从 ${clearWindow} 轮压缩至 ${effectiveWindow} 轮` +
+    footer += `\n⚠️ 注意：近期工具返回内容体积过大（超出预算 ${maxHistoryChars} 字符），已自动将完整结果窗口压缩至 ${effectiveWindow} 轮` +
       (effectiveMaxChars < MAX_RESULT_CHARS ? `，并将单条结果截断上限收紧至 ${effectiveMaxChars} 字符` : '') +
-      `。建议缩小读取范围（如分段读取文件、限制返回条数），并勤快记录笔记保存关键信息，避免反复获取大体积内容。\n`;
+      `。建议缩小读取范围（如分段读取文件、限制返回条数），并勤快记录笔记保存关键信息，避免反复获取大体积内容。`;
   }
 
-  return header + body;
+  return header + body + footer;
 }
 
 export const ReActProtocols = {
@@ -234,6 +242,7 @@ export const ReActProtocols = {
     toolResults: Array<{
       toolName: string;
       parameters: Record<string, any>;
+      roundNumber?: number;
       result: {
         success: boolean;
         data?: any;

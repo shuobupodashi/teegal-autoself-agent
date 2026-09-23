@@ -195,6 +195,50 @@ router.get('/resources', async (req: Request, res: Response) => {
   res.json({ success: true, resources });
 });
 
+// 🔥 添加自有机器（用户自己的服务器）：密码只进凭据库不经后端，本地建档不过云端账本
+router.post('/resources/self', (req: Request, res: Response) => {
+  try {
+    const { userId, appId, host, port, username, credentialName } = req.body || {};
+    if (!host || !username) {
+      res.status(400).json({ success: false, error: '缺少 host 或 username' });
+      return;
+    }
+    // 同机器防重复绑定（活跃记录）
+    const dup = sshResourceDAO.findActiveByHost(String(host), Number(port || 22), String(username));
+    if (dup) {
+      res.json({ success: true, duplicated: true, resourceId: dup.id, remark: '该机器已在常驻列表中' });
+      return;
+    }
+    const resource = sshResourceDAO.addSelf({
+      id: `sshres-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      user_id: String(userId || 'unknown'),
+      app_id: String(appId || ''),
+      name: `自有 ${host}`,
+      host: String(host),
+      port: Number(port || 22),
+      username: String(username),
+      credential_name: String(credentialName || ''),
+    });
+    res.json({ success: true, resourceId: resource.id });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 🔥 自有机器解绑：只解除本地关联（机器本身不受影响，凭据保留；云端实例必须走 /close 结算）
+router.post('/resources/:id/unbind', (req: Request, res: Response) => {
+  const rec = sshResourceDAO.getById(req.params.id);
+  if (!rec) {
+    res.status(404).json({ success: false, error: '资源记录不存在' });
+    return;
+  }
+  if (rec.source === 'cloud') {
+    res.status(400).json({ success: false, error: '云端实例请走关机结算（/close），不能解绑' });
+    return;
+  }
+  res.json({ success: sshResourceDAO.markClosedById(req.params.id) });
+});
+
 // 本地收尾（工具直调云端关机后回调，只改本地表不动云端）
 router.post('/resources/close-by-key', (req: Request, res: Response) => {
   const key = String(req.body?.key || '');

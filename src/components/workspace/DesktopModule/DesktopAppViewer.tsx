@@ -27,6 +27,7 @@ import { appDatabaseService } from '@/utils/apptool/AppDatabaseService';
 import GPUSelectorDialog from './GPUSelectorDialog';
 import SSHSelectorDialog, { SshSpecOption } from './SSHSelectorDialog';
 import { sshOpenInstance } from '@/utils/systemtools/sshInstance';
+import { isSameProjectId } from '@/utils/apptool/ProjectIdResolver';
 import { ECSWebSocketManager } from '@/utils/workspace/ECSWebSocketManager';
 import HistoryTaskList, { HistoryTaskListRef, TrainingTask } from './HistoryTaskList';
 import ExecutionLogList, { ExecutionLogListRef, ExecutionLog } from './ExecutionLogList';
@@ -152,7 +153,8 @@ export const DesktopAppViewer: React.FC<DesktopAppViewerProps> = ({
     try {
       const resp = await fetch(`${getBackendUrl()}/api/rental/resources?userId=${encodeURIComponent(userId)}&active=1`);
       const data = await resp.json().catch(() => null);
-      const mine = (data?.resources || []).filter((r: any) => r.app_id === appId);
+      // 🔥 长短 id 兼容比对：存量记录可能登记短 id/截断 slug
+      const mine = (data?.resources || []).filter((r: any) => isSameProjectId(r.app_id, appId));
       setHasRunningResident(mine.length > 0);
     } catch {
       // 本地后端不可达，保持现状

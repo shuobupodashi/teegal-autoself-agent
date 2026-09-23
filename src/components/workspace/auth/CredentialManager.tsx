@@ -25,11 +25,9 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
-import { Plus, Trash2, Edit2, Key, Eye, EyeOff, Loader2, ShieldCheck, Save, X, Settings, Import, Copy, Check } from 'lucide-react';
+import { Plus, Trash2, Edit2, Key, Eye, EyeOff, Loader2, ShieldCheck, Save, X, Settings, Copy, Check } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
-import { ModelManager } from '@/utils/llm/ModelManager';
-import { Switch } from '@/components/ui/switch';
-import { suggestEnvVarName, isAutoImportEnabled, setAutoImportEnabled, syncModelKeyCredentials } from './modelKeySync';
+import { syncModelKeyCredentials } from './modelKeySync';
 
 type CredentialKind = 'env' | 'param';
 
@@ -58,8 +56,6 @@ const PARAM_RANGES: Record<string, { min: number; max: number }> = {
   clearWindow: { min: 3, max: 15 },
   maxHistoryChars: { min: 20000, max: 200000 },
 };
-
-// 🔥 从模型导入：推荐环境变量名与自动同步逻辑统一在 modelKeySync.ts 维护
 
 interface FormData {
   kind: CredentialKind;
@@ -93,85 +89,19 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
-  // 🔥 从模型导入
-  const [showModelImport, setShowModelImport] = useState(false);
-  const [importModels, setImportModels] = useState<any[]>([]);
-  const [importLoading, setImportLoading] = useState(false);
-  // 🔥 自动导入模型密钥（默认开）
-  const [autoImport, setAutoImport] = useState(isAutoImportEnabled());
-  const [syncing, setSyncing] = useState(false);
 
   const { user } = useAuth();
   const userId = user?.id;
 
-  // 🔥 自动同步：凭据池镜像「我的模型」的 API Key（开关制，详见 modelKeySync.ts）
-  const runSync = useCallback(async (silent: boolean) => {
+  // 🔥 自动同步：凭据池始终镜像「我的模型」+「搜索源」的 API Key（增/改/删跟随，无开关）
+  const runSync = useCallback(async () => {
     if (!userId) return;
-    setSyncing(true);
     try {
-      const r = await syncModelKeyCredentials(userId);
-      if (!silent && (r.created || r.updated || r.removed)) {
-        toast.success(`模型密钥已同步：新增 ${r.created}，更新 ${r.updated}，移除 ${r.removed}`);
-      }
+      await syncModelKeyCredentials(userId);
     } catch (e: any) {
-      if (!silent) toast.error(`同步失败: ${e.message}`);
-    } finally {
-      setSyncing(false);
+      console.warn('[CREDENTIAL] 模型密钥同步失败:', e?.message);
     }
   }, [userId]);
-
-  const handleToggleAutoImport = async (enabled: boolean) => {
-    setAutoImport(enabled);
-    setAutoImportEnabled(enabled);
-    if (enabled) {
-      // 开启即执行一次同步并刷新列表
-      await runSync(false);
-      loadCredentials();
-    }
-  };
-
-  // 🔥 加载用户模型列表供导入
-  const loadModelsForImport = async () => {
-    if (!userId) {
-      toast.error('请先登录后再导入模型');
-      return;
-    }
-    setImportLoading(true);
-    try {
-      await ModelManager.initialize(userId);
-      const models = ModelManager.getUserModels().filter((m: any) => m.apiKey);
-      if (models.length === 0) {
-        toast.info('没有可导入的模型（需已配置 API Key）');
-        return;
-      }
-      setImportModels(models);
-      setShowModelImport(true);
-    } catch (error: any) {
-      toast.error(`加载模型失败: ${error.message}`);
-    } finally {
-      setImportLoading(false);
-    }
-  };
-
-  // 🔥 选中模型 → 填充表单（建议名与已有凭据去重）
-  const handleImportModel = (model: any) => {
-    let envVar = suggestEnvVarName(model.url, model.modelId);
-    const existing = new Set(credentials.filter(c => c.type !== 'param').map(c => c.env_var));
-    if (existing.has(envVar)) {
-      let i = 2;
-      while (existing.has(`${envVar}_${i}`)) i++;
-      envVar = `${envVar}_${i}`;
-    }
-    setEditingId(null);
-    setForm({
-      kind: 'env',
-      env_var: envVar,
-      description: `模型 ${model.modelId} 的 API Key${model.url ? `（接口: ${model.url}）` : ''}`,
-      value: model.apiKey,
-    });
-    setShowModelImport(false);
-    setShowForm(true);
-  };
 
   const loadCredentials = useCallback(async () => {
     if (!userId) {
@@ -231,15 +161,10 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
   useEffect(() => {
     if (open) {
       setShowForm(false); // 🔥 每次打开重置到列表视图（避免上次停留在表单）
-      setShowModelImport(false);
       setDeleteConfirmId(null);
       if (userId) {
-        // 🔥 自动导入开启时先镜像同步，再加载列表（同步无变化时不打扰）
-        if (isAutoImportEnabled()) {
-          runSync(true).finally(() => loadCredentials());
-        } else {
-          loadCredentials();
-        }
+        // 🔥 先镜像同步（无变化不打扰），再加载列表
+        runSync().finally(() => loadCredentials());
       }
     }
   }, [open, userId, loadCredentials, runSync]);
@@ -491,7 +416,7 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
           </DialogTitle>
         </DialogHeader>
 
-        {!showForm && !showModelImport ? (
+        {!showForm ? (
           /* 列表视图 */
           <div className="flex-1 overflow-y-auto">
             <div className="flex items-center justify-between mb-3">
@@ -499,45 +424,11 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
                 凭据:仅保存本地，对llm不可见
               </p>
               <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={loadModelsForImport}
-                  className="h-7 px-2 text-xs"
-                  disabled={importLoading}
-                >
-                  {importLoading ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" />
-                  ) : (
-                    <Import className="h-3.5 w-3.5 mr-1" />
-                  )}
-                  从模型导入
-                </Button>
                 <Button size="sm" onClick={handleAdd} className="h-7 px-2 text-xs">
                   <Plus className="h-3.5 w-3.5" />
                   添加
                 </Button>
               </div>
-            </div>
-
-            {/* 🔥 自动导入模型密钥开关：开启后凭据池镜像「我的模型」的 API Key */}
-            <div className="flex items-center justify-between mb-3 px-3 py-2 rounded-md bg-muted/50">
-              <div className="min-w-0">
-                <p className="text-xs font-medium flex items-center gap-1.5">
-                  自动导入模型密钥
-                  {syncing && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
-                </p>
-                <p className="text-[11px] text-muted-foreground mt-0.5">
-                  {autoImport
-                    ? '已配 API Key 的模型会自动同步为凭据（改 key 自动更新，删模型自动移除）；不需要的 key 请先关闭本开关再删除'
-                    : '已关闭：凭据完全手工维护，可用「从模型导入」按需添加'}
-                </p>
-              </div>
-              <Switch
-                checked={autoImport}
-                onCheckedChange={handleToggleAutoImport}
-                className="ml-3 flex-shrink-0"
-              />
             </div>
 
             {loading ? (
@@ -573,41 +464,6 @@ export const CredentialManager: React.FC<CredentialManagerProps> = ({
                 )}
               </div>
             )}
-          </div>
-        ) : showModelImport ? (
-          /* 🔥 模型导入选择视图 */
-          <div className="flex-1 overflow-y-auto">
-            <div className="flex items-center justify-between mb-3">
-              <p className="text-xs text-muted-foreground">
-                选择模型，将其 API Key 导入为凭据
-              </p>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => setShowModelImport(false)}
-                className="h-7 px-2 text-xs"
-              >
-                <X className="h-3.5 w-3.5" />
-                返回
-              </Button>
-            </div>
-            <div className="space-y-2">
-              {importModels.map((m: any) => (
-                <button
-                  key={m.id}
-                  onClick={() => handleImportModel(m)}
-                  className="w-full flex items-center gap-2 p-3 rounded-lg border bg-card hover:bg-accent/50 transition-colors text-left"
-                >
-                  <Key className="h-3.5 w-3.5 text-green-600 flex-shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium font-mono truncate">{m.modelId}</p>
-                    <p className="text-xs text-muted-foreground truncate">
-                      导入为 {suggestEnvVarName(m.url, m.modelId)}
-                    </p>
-                  </div>
-                </button>
-              ))}
-            </div>
           </div>
         ) : (
           /* 表单视图 */

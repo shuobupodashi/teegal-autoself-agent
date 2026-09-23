@@ -192,6 +192,7 @@ export const ApiClient = {
       toolResults: Array<{
         toolName: string;
         parameters: Record<string, any>;
+        roundNumber?: number;
         result: {
           success: boolean;
           data?: any;

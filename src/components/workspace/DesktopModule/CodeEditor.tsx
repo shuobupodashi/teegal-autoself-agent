@@ -8,9 +8,37 @@ import 'prismjs/components/prism-typescript';
 import 'prismjs/components/prism-jsx';
 import 'prismjs/components/prism-tsx';
 import 'prismjs/components/prism-json';
+// 🔥 补全常用语言组件（css/html/xml/clike/javascript 由 prism core 自带）——
+// 之前语言映射只认 js/ts/json，其余一律按 python tokenize，
+// .tsx/.css/.md 等文件全部无 token class（一片黑）
+import 'prismjs/components/prism-markdown';
+import 'prismjs/components/prism-yaml';
+import 'prismjs/components/prism-bash';
+import 'prismjs/components/prism-sql';
+import 'prismjs/components/prism-docker';
+import 'prismjs/components/prism-graphql';
+import 'prismjs/components/prism-ini';
 import './code-editor-theme.css';
 import DiffViewer from './DiffViewer';
 import { MessageSquarePlus, Search, X, ArrowUp, ArrowDown } from 'lucide-react';
+
+// 🔥 扩展名 → Prism 语言映射（与 CodeFileViewer 的 EXTENSION_TO_LANGUAGE 保持一致）
+const EXTENSION_TO_LANGUAGE: Record<string, string> = {
+  py: 'python', python: 'python',
+  js: 'javascript', javascript: 'javascript', mjs: 'javascript', cjs: 'javascript',
+  ts: 'typescript', typescript: 'typescript', mts: 'typescript', cts: 'typescript',
+  tsx: 'tsx', jsx: 'jsx',
+  json: 'json', jsonc: 'json',
+  yaml: 'yaml', yml: 'yaml',
+  md: 'markdown', markdown: 'markdown', mdx: 'markdown',
+  css: 'css', scss: 'css', sass: 'css', less: 'css',
+  html: 'html', htm: 'html', xml: 'xml', svg: 'xml', vue: 'markup',
+  sql: 'sql',
+  sh: 'bash', bash: 'bash', zsh: 'bash', shell: 'bash',
+  dockerfile: 'docker',
+  graphql: 'graphql', gql: 'graphql',
+  ini: 'ini', conf: 'ini', env: 'ini',
+};
 
 interface CodeEditorProps {
   value?: string;
@@ -112,10 +140,12 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   }, []);
 
   const getPrismLanguage = (): string => {
+    // 🔥 优先按文件扩展名推断（language prop 可能是父组件写死的默认值，如 python）
+    const ext = (filePath || '').split('.').pop()?.toLowerCase() || '';
+    if (ext && EXTENSION_TO_LANGUAGE[ext]) return EXTENSION_TO_LANGUAGE[ext];
     const lang = language.toLowerCase();
-    if (['javascript', 'js'].includes(lang)) return 'javascript';
-    if (['typescript', 'ts'].includes(lang)) return 'typescript';
-    return lang === 'json' ? 'json' : 'python';
+    if (EXTENSION_TO_LANGUAGE[lang]) return EXTENSION_TO_LANGUAGE[lang];
+    return lang; // 未知语言由调用方兜底（clike / 纯文本）
   };
 
   const highlightCode = (code: string): string => {
@@ -124,6 +154,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     // 判据用"最长行"而不是文件总大小：正常代码行宽有限，大文件只是慢不至于死；
     // 只有超长单行才降级为转义纯文本（无语法颜色，但可正常查看/编辑），保留弹性
     const MAX_LINE_LENGTH = 10 * 1024; // 单行超 10KB 判定为打包/压缩产物
+    const escapePlain = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     if (code.length > MAX_LINE_LENGTH) {
       let maxLine = 0, lineStart = 0;
       for (let i = 0; i < code.length; i++) {
@@ -136,12 +167,22 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       }
       if (code.length - lineStart > maxLine) maxLine = code.length - lineStart; // 最后一行
       if (maxLine > MAX_LINE_LENGTH) {
-        return code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return escapePlain(code);
       }
     }
 
     const prismLanguage = getPrismLanguage();
-    let highlighted = Prism.highlight(code, Prism.languages[prismLanguage], prismLanguage);
+    // 🔥 未知语言兜底 clike（C 系通用语法，keyword/string/comment 有基本颜色），Prism.highlight 异常时降级纯文本
+    const grammar = Prism.languages[prismLanguage] || Prism.languages.clike;
+    let highlighted: string;
+    try {
+      highlighted = grammar
+        ? Prism.highlight(code, grammar, prismLanguage)
+        : escapePlain(code);
+    } catch (e) {
+      console.warn('[CodeEditor] Prism 高亮失败，降级纯文本:', e);
+      highlighted = escapePlain(code);
+    }
     
     // 🔥 通用高亮函数：在 Prism 高亮后的 HTML 中，对纯文本部分添加 <mark> 高亮
     const applyHighlight = (html: string, searchText: string, className: string, matchAll: boolean = false): string => {

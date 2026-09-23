@@ -98,6 +98,62 @@ export class SshResourceDAO {
     );
   }
 
+  /** 🔥 添加自有机器（用户自己的服务器：不过云端账本、不计费、不参与对账） */
+  addSelf(rec: {
+    id: string;
+    user_id: string;
+    app_id?: string;
+    name: string;
+    host: string;
+    port: number;
+    username: string;
+    credential_name: string;
+  }): SshResource {
+    const db = localDatabase.getDb();
+    const now = Date.now();
+    db.prepare(`
+      INSERT INTO ssh_resources (
+        id, user_id, app_id, name, source, provider, instance_type,
+        host, port, username, credential_name,
+        cloud_rental_id, cloud_instance_id, price_per_hour, status, remark, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, 'workstation', 'self', 'self', ?, ?, ?, ?, '', '', 0, 'running', '自有机器（本地维护）', ?, ?)
+    `).run(
+      rec.id,
+      rec.user_id || 'unknown',
+      rec.app_id || '',
+      rec.name,
+      rec.host,
+      rec.port || 22,
+      rec.username,
+      rec.credential_name || '',
+      now,
+      now
+    );
+    return this.getById(rec.id)!;
+  }
+
+  /** 🔥 自有机器查重：同 host+port+username 的活跃记录（防重复绑定） */
+  findActiveByHost(host: string, port: number, username: string): SshResource | null {
+    const row = localDatabase.getDb().prepare(`
+      SELECT * FROM ssh_resources
+      WHERE source = 'workstation' AND host = ? AND port = ? AND username = ?
+        AND status IN ('booting', 'running')
+      LIMIT 1
+    `).get(host, port, username) as any;
+    return row || null;
+  }
+
+  /** 🔥 自有机器解绑（只解除本地关联；机器本身不受影响，云端账本无关） */
+  markClosedById(id: string): boolean {
+    const result = localDatabase.getDb().prepare(`
+      UPDATE ssh_resources
+      SET status = 'closed', closed_at = ?, updated_at = ?
+      WHERE id = ? AND status IN ('booting', 'running')
+    `).run(Date.now(), Date.now(), id);
+    return result.changes > 0;
+  }
+
   /** 按云端键（rentalId 或底层 instanceId）关机收尾 */
   markClosedByCloudKey(cloudKey: string): void {
     const db = localDatabase.getDb();

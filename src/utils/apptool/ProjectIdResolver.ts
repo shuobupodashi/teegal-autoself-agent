@@ -53,3 +53,16 @@ export async function resolveProjectId(
     return `projectId "${appId}" 解析失败: ${error}。请使用完整的 36 位 UUID。`;
   }
 }
+
+/**
+ * 长短 id 兼容比对（存量数据可能登记短 id，新数据统一完整 id）：
+ * 完全相等，或一方是另一方的前缀且较短一方 >= 8 位（短 id 约定长度）
+ */
+export function isSameProjectId(a?: string | null, b?: string | null): boolean {
+  if (!a || !b) return false;
+  const la = a.toLowerCase();
+  const lb = b.toLowerCase();
+  if (la === lb) return true;
+  const [short, long] = la.length <= lb.length ? [la, lb] : [lb, la];
+  return short.length >= 8 && long.startsWith(short);
+}

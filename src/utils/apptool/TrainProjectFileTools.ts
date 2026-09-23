@@ -235,6 +235,52 @@ function sortFileNodes(nodes: FileNode[]): FileNode[] {
 }
 
 /**
+ * 🔥 read_project_file 路径定位兜底
+ * LLM 传的 filePath 可能是裸文件名（server.ts）或层级猜错的相对路径——
+ * 典型如 base-bootcode：仓库 clone 在项目子目录 teegal-autoprojects/ 下，
+ * 从项目根拼路径必然差层。按请求在项目文件树中定位真实文件：
+ * 唯一命中 → 返回真实相对路径；多个命中 → 返回候选列表；没有 → none
+ * （扫描根与 read 的 baseDir 同为 getAppBasePath，relativePath 与拼接路径一致）
+ */
+async function relocateProjectFile(
+  fullAppId: string,
+  filePath: string
+): Promise<{ status: 'unique'; relativePath: string } | { status: 'multiple'; candidates: string[] } | { status: 'none' }> {
+  try {
+    const filesDir = await getAppBasePath(fullAppId);
+    const rootNodes = filterFileNodes(await scanDirectory(filesDir));
+    const files: FileNode[] = [];
+    const collect = (nodes: FileNode[]) => {
+      for (const n of nodes) {
+        if (n.type === 'file') files.push(n);
+        if (n.children) collect(n.children);
+      }
+    };
+    collect(rootNodes);
+    if (files.length === 0) return { status: 'none' };
+
+    const norm = (p: string) => p.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+    const wanted = norm(filePath);
+    const baseName = wanted.split('/').pop() || wanted;
+
+    const matched = files.filter((n) => {
+      const rel = norm(n.relativePath || n.name);
+      return rel === wanted || rel.endsWith(`/${wanted}`) || n.name.toLowerCase() === baseName;
+    });
+
+    if (matched.length === 1) {
+      return { status: 'unique', relativePath: (matched[0].relativePath || matched[0].name).replace(/\\/g, '/') };
+    }
+    if (matched.length > 1) {
+      return { status: 'multiple', candidates: matched.map((n) => (n.relativePath || n.name).replace(/\\/g, '/')) };
+    }
+    return { status: 'none' };
+  } catch {
+    return { status: 'none' };
+  }
+}
+
+/**
  * 获取语言类型
  */
 function getLanguage(ext: string): string {
@@ -715,8 +761,8 @@ export async function executeReadProjectFileTool(
   const appId = extractAppId(params, step.appId);
   console.log(`[READ-FILE] 🔍 提取 appId: ${appId}`);
   
-  // 提取 filePath
-  const filePath = params?.filePath || params?.filepath || params?.file_path || params?.path || params?.fileName;
+  // 提取 filePath（let：路径定位兜底命中后会被改写为真实相对路径）
+  let filePath = params?.filePath || params?.filepath || params?.file_path || params?.path || params?.fileName;
   console.log(`[READ-FILE] 🔍 提取 filePath: ${filePath}`);
 
   // 🔥 提取可选的搜索参数
@@ -801,13 +847,28 @@ export async function executeReadProjectFileTool(
     const fullPath = `${baseDir}\\${normalizedPath}`;
 
     // 读取文件
-    const result = await electron.userpcFile.read(fullPath);
+    let result = await electron.userpcFile.read(fullPath);
 
     if (!result.success) {
-      return {
-        success: false,
-        error: result.error || `文件不存在: ${filePath}`,
-      };
+      // 🔥 路径定位兜底：LLM 传的 filePath 可能是裸文件名（server.ts）或层级猜错的
+      // 相对路径——典型如 base-bootcode 仓库套层项目，文件在 teegal-autoprojects/ 子目录下
+      const relocated = await relocateProjectFile(fullAppId, filePath);
+      if (relocated.status === 'unique') {
+        console.log(`[READ-FILE] 🔁 路径定位兜底: ${filePath} → ${relocated.relativePath}`);
+        filePath = relocated.relativePath;
+        result = await electron.userpcFile.read(`${baseDir}\\${filePath.replace(/\//g, '\\')}`);
+        if (!result.success) {
+          return { success: false, error: result.error || `文件不存在: ${filePath}` };
+        }
+      } else if (relocated.status === 'multiple') {
+        const list = relocated.candidates.slice(0, 10).join('\n  ');
+        return {
+          success: false,
+          error: `文件不存在: ${filePath}。项目内找到 ${relocated.candidates.length} 个同名/同路径文件，请用完整相对路径重试：\n  ${list}`,
+        };
+      } else {
+        return { success: false, error: result.error || `文件不存在: ${filePath}` };
+      }
     }
 
     const content = result.data?.content || '';

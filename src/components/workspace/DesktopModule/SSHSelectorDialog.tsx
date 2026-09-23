@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Sparkles, Cloud, Loader2, OctagonX, Copy, Check } from 'lucide-react';
+import { Sparkles, Cloud, Loader2, OctagonX, Copy, Check, Unlink, Plus } from 'lucide-react';
 import { getBackendUrl } from '@/config/env';
-import { sshListActive, sshCloseInstance } from '@/utils/systemtools/sshInstance';
+import { sshListActive, sshCloseInstance, sshAddSelfInstance } from '@/utils/systemtools/sshInstance';
 
 /**
  * 云端常驻实例选择弹窗（长期租赁语义，与 GPUSelectorDialog 的短任务区分）
@@ -33,6 +33,8 @@ interface ActiveInstance {
   app_id: string;             // 项目归属（开机登记；空 = 未关联项目）
   price_per_hour: number;
   credential_name: string;    // 对应凭据编号（ssh_ins-xxx）
+  source: string;             // cloud=云端租赁（计费）/ workstation=用户自有机器（不计费）
+  port: number;               // SSH 端口（自有机器可能非 22）
 }
 
 interface SSHSelectorDialogProps {
@@ -61,6 +63,15 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
   const [loading, setLoading] = useState(false);
   const [closingId, setClosingId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // 自有机器绑定表单
+  const [showSelfForm, setShowSelfForm] = useState(false);
+  const [selfHost, setSelfHost] = useState('');
+  const [selfPort, setSelfPort] = useState('22');
+  const [selfUsername, setSelfUsername] = useState('root');
+  const [selfPassword, setSelfPassword] = useState('');
+  const [selfAdding, setSelfAdding] = useState(false);
+  const [selfProgress, setSelfProgress] = useState('');
+  const [selfError, setSelfError] = useState<string | null>(null);
 
   // 复制 ssh 地址（user@IP，可直接拼连接命令），成功显示对勾 1.5s
   const handleCopyAddress = async (inst: ActiveInstance) => {
@@ -100,8 +111,9 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
 
       if (active.ok) {
         setActiveInstances(active.instances.map((r: any) => ({
-          id: r.cloud_rental_id || r.cloud_instance_id,
-          instance_id: r.cloud_instance_id || '',
+          // 自有机器（workstation）无云端键，必须用本地 id，否则解绑传错 id
+          id: r.source === 'workstation' ? r.id : (r.cloud_rental_id || r.cloud_instance_id),
+          instance_id: r.source === 'workstation' ? 'self' : (r.cloud_instance_id || ''),
           instance_type: r.instance_type,
           status: r.status,
           host: r.host || '',
@@ -109,6 +121,8 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
           app_id: r.app_id || '',
           price_per_hour: r.price_per_hour || 0,
           credential_name: r.credential_name || '',
+          source: r.source || 'cloud',
+          port: r.port || 22,
         })));
       }
     } catch (error) {
@@ -125,7 +139,7 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
     }
   }, [isOpen, fetchData]);
 
-  // 关机（核心层统一处理：云端结算 + 本地收尾 + 凭据同步删除）
+  // 关机/解绑（核心层统一处理：云端实例走云端结算；自有机器仅解绑 + 凭据同步删除）
   const handleCloseInstance = async (inst: ActiveInstance) => {
     setClosingId(inst.id);
     try {
@@ -139,6 +153,39 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
       console.warn('[SSH-SELECTOR] 关机失败:', error);
     } finally {
       setClosingId(null);
+    }
+  };
+
+  // 绑定自有机器（核心层负责连通测试/公钥注入/凭据入库/建档，失败自动回滚）
+  const handleSubmitSelf = async () => {
+    if (!selfHost.trim() || !selfUsername.trim() || !selfPassword) {
+      setSelfError('请填写服务器地址、用户名和密码');
+      return;
+    }
+    setSelfAdding(true);
+    setSelfError(null);
+    try {
+      const r = await sshAddSelfInstance({
+        host: selfHost.trim(),
+        port: Number(selfPort) || 22,
+        username: selfUsername.trim(),
+        password: selfPassword,
+        projectId: currentAppId || undefined,
+        userId,
+        onProgress: (msg) => setSelfProgress(msg),
+      });
+      if (!r.ok) {
+        setSelfError(r.error || '绑定失败');
+        return;
+      }
+      setShowSelfForm(false);
+      setSelfHost(''); setSelfPort('22'); setSelfUsername('root'); setSelfPassword('');
+      await fetchData();
+    } catch (error: any) {
+      setSelfError(error?.message || String(error));
+    } finally {
+      setSelfAdding(false);
+      setSelfProgress('');
     }
   };
 
@@ -164,13 +211,41 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
         </div>
 
         <div className="p-6 max-h-[420px] overflow-y-auto">
-          {/* 活跃实例：常驻中，可关机 */}
-          {activeInstances.length > 0 && (
-            <div className="mb-4">
-              <div className="text-xs font-medium text-gray-500 mb-2">运行中的实例</div>
+          {/* 活跃实例：常驻中，可关机（云端）/ 解绑（自有机器，不影响机器本身） */}
+          <div className="mb-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-xs font-medium text-gray-500">运行中的实例</div>
+              <button
+                onClick={() => { setShowSelfForm(!showSelfForm); setSelfError(null); }}
+                className="text-xs text-violet-600 hover:text-violet-700 inline-flex items-center gap-0.5 font-medium transition-colors"
+              >
+                <Plus className="w-3 h-3" /> 自有机器
+              </button>
+            </div>
+
+            {/* 自有机器绑定表单（不计费、不过云端账本） */}
+            {showSelfForm && (
+              <div className="mb-2 p-3 rounded-lg border border-violet-200 bg-violet-50/50">
+                <div className="grid grid-cols-[1fr_70px_1fr] gap-2 mb-2">
+                  <input value={selfHost} onChange={(e) => setSelfHost(e.target.value)} disabled={selfAdding} placeholder="服务器地址（IP / 域名）" className="px-2 py-1.5 text-sm border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-1 focus:ring-violet-300 disabled:opacity-50" />
+                  <input value={selfPort} onChange={(e) => setSelfPort(e.target.value)} disabled={selfAdding} placeholder="端口" className="px-2 py-1.5 text-sm border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-1 focus:ring-violet-300 disabled:opacity-50" />
+                  <input value={selfUsername} onChange={(e) => setSelfUsername(e.target.value)} disabled={selfAdding} placeholder="用户名（root / ubuntu）" className="px-2 py-1.5 text-sm border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-1 focus:ring-violet-300 disabled:opacity-50" />
+                </div>
+                <div className="flex gap-2">
+                  <input type="password" value={selfPassword} onChange={(e) => setSelfPassword(e.target.value)} disabled={selfAdding} placeholder="密码" className="flex-1 px-2 py-1.5 text-sm border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-1 focus:ring-violet-300 disabled:opacity-50" />
+                  <button onClick={handleSubmitSelf} disabled={selfAdding} className="px-3 py-1.5 text-xs font-medium bg-violet-600 text-white rounded-md hover:bg-violet-700 inline-flex items-center gap-1 whitespace-nowrap disabled:opacity-50 transition-colors">
+                    {selfAdding && <Loader2 className="w-3 h-3 animate-spin" />}
+                    {selfAdding ? (selfProgress || '处理中...') : '绑定'}
+                  </button>
+                </div>
+                {selfError && <div className="mt-2 text-xs text-red-600">{selfError}</div>}
+              </div>
+            )}
+
+            {activeInstances.length > 0 && (
               <div className="grid gap-2">
                 {activeInstances.map((inst) => (
-                  <div key={inst.id} className="p-3 rounded-lg border border-blue-200 bg-blue-50/50 flex justify-between items-center">
+                  <div key={inst.id} className={`p-3 rounded-lg border flex justify-between items-center ${inst.source === 'workstation' ? 'border-violet-200 bg-violet-50/50' : 'border-blue-200 bg-blue-50/50'}`}>
                     <div className="flex items-center gap-3">
                       {inst.status === 'running' ? (
                         <span className="h-2 w-2 rounded-full bg-green-500" />
@@ -192,9 +267,16 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
                             </button>
                           )}
                           <span className="ml-1 text-xs text-gray-500">{inst.instance_type}</span>
+                          {inst.source === 'workstation' && (
+                            <span className="text-[10px] px-1.5 py-px rounded-full bg-violet-100 text-violet-700">自有</span>
+                          )}
                         </div>
                         <div className="text-xs text-gray-500 inline-flex items-center gap-0.5">
-                          <Sparkles className="h-3 w-3" />{Number(inst.price_per_hour).toFixed(2)}/小时
+                          {inst.source === 'workstation' ? (
+                            <span className="text-violet-600 font-medium">自有 · 不计费</span>
+                          ) : (
+                            <><Sparkles className="h-3 w-3" />{Number(inst.price_per_hour).toFixed(2)}/小时</>
+                          )}
                           {/* 归属标签：项目视角下的机器归属（全局列表也能看出关联） */}
                           <span className={`ml-2 text-[10px] px-1.5 py-px rounded-full ${
                             inst.app_id === currentAppId
@@ -214,16 +296,24 @@ const SSHSelectorDialog: React.FC<SSHSelectorDialogProps> = ({
                     <button
                       onClick={() => handleCloseInstance(inst)}
                       disabled={closingId === inst.id}
-                      className="px-2 py-1 text-xs text-red-600 hover:bg-red-50 rounded-md inline-flex items-center gap-1 transition-colors disabled:opacity-50"
+                      className={`px-2 py-1 text-xs rounded-md inline-flex items-center gap-1 transition-colors disabled:opacity-50 ${
+                        inst.source === 'workstation' ? 'text-gray-500 hover:bg-gray-100' : 'text-red-600 hover:bg-red-50'
+                      }`}
                     >
-                      {closingId === inst.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <OctagonX className="w-3 h-3" />}
-                      关机
+                      {closingId === inst.id ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : inst.source === 'workstation' ? (
+                        <Unlink className="w-3 h-3" />
+                      ) : (
+                        <OctagonX className="w-3 h-3" />
+                      )}
+                      {inst.source === 'workstation' ? '解绑' : '关机'}
                     </button>
                   </div>
                 ))}
               </div>
-            </div>
-          )}
+            )}
+          </div>
 
           {/* 规格列表 */}
           <div className="text-xs font-medium text-gray-500 mb-2">开机新实例（CPU / GPU 均可长租）</div>

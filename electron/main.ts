@@ -523,7 +523,12 @@ function setupIPC() {
     // 已有 viewer 窗口：通知其新增 tab（页面自行去重）并置前
     if (appViewerWindow && !appViewerWindow.isDestroyed()) {
       appViewerWindow.webContents.send('app-viewer:add-tab', { appId, name });
+      // 🔥 Windows 下 focus() 常不提升 Z 序（多屏场景窗口被压在其他窗口下面，最小化时更是无效）：
+      // 先恢复最小化，再 show + focus + moveTop，确保窗口真正跑到前台
+      if (appViewerWindow.isMinimized()) appViewerWindow.restore();
+      appViewerWindow.show();
       appViewerWindow.focus();
+      if (process.platform === 'win32') appViewerWindow.moveTop();
       return { success: true, reused: true };
     }
 

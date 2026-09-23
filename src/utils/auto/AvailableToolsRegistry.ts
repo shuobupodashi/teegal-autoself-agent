@@ -216,7 +216,7 @@ export const AVAILABLE_TOOLS: ToolDefinition[] = [
 
   // 🔥 常驻实例租赁：开机云端实例（带公钥免密）→ userpc_shell 直接 ssh 操作 → close 关机结算
   // projectId 可选：登记项目归属（list 可看出"项目专属机"，跨项目不复用）
-  { id: 50, name: "ssh_instance", displayName: "常驻实例操作", tokens: ["execution"], params: "action?(默认activate), instanceType?(activate必传，如S5.MEDIUM4/GN7.2XLARGE32), instanceId?(close必传/activate复用指定实例), projectId?(activate时登记项目归属)" },
+  { id: 50, name: "ssh_instance", displayName: "常驻实例操作", tokens: ["execution"], params: "action?(默认activate: activate开机/close关机/list列表/add绑定自有机器), instanceType?(activate必传,如S5.MEDIUM4), instanceId?(close必传/activate复用指定实例), projectId?(登记归属,短id/完整id), host/username/password?(add必传,用户自有服务器), port?(add可选,默认22)" },
 ];
 
 // 🔥 扩展工具存储（动态添加）

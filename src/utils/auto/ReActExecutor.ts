@@ -24,10 +24,28 @@ function truncateWriteNotes(notes: string, maxRounds: number): string {
   
   // 只保留最近 maxRounds 轮
   const recentRounds = rounds.slice(-maxRounds);
-  
+
   // 添加省略提示
   const omittedCount = rounds.length - maxRounds;
   return `[省略了前 ${omittedCount} 轮笔记]\n---\n${recentRounds.join('\n---\n')}`;
+}
+
+/**
+ * 🔥 缓存友好：不丢弃旧轮条目（丢弃会让后端折叠行整体平移、每轮打断 prompt 前缀缓存），
+ * 只把最近 keepFull 轮之外的旧条目结果体裁剪成短摘要，减小请求体积。
+ * 后端折叠行只渲染工具名+参数，不渲染结果体，因此裁剪不影响 prompt 渲染。
+ * 注意：clearWindow 建议不超过 keepFull，避免"完整渲染区"落进裁剪区导致内容变化。
+ */
+function trimToolResultsForPayload(toolResults: ToolResult[], keepFull: number): ToolResult[] {
+  if (toolResults.length <= keepFull) return toolResults;
+  return toolResults.map((t, i) => {
+    if (i >= toolResults.length - keepFull) return t;
+    const dataStr = t.result?.success
+      ? (typeof t.result.data === 'string' ? t.result.data : JSON.stringify(t.result.data ?? ''))
+      : (t.result?.error || '');
+    const brief = dataStr.length > 200 ? `${dataStr.substring(0, 200)}…[旧轮结果已省略]` : (dataStr || '(旧轮结果已省略)');
+    return { ...t, result: { ...t.result, data: brief } };
+  });
 }
 
 export interface ReActCallbacks {
@@ -59,6 +77,8 @@ export interface ReActExecuteParams {
 interface ToolResult {
   toolName: string;
   parameters: Record<string, any>;
+  /** 🔥 真实轮号：后端折叠行用真实轮号渲染，保证内容只由条目自身决定 */
+  roundNumber?: number;
   result: AutoToolResult;
 }
 
@@ -259,7 +279,7 @@ export class ReActExecutor {
     } = params;
 
     const MAX_ROUNDS = 500;
-    const RESULT_WINDOW = 30;   // 滑动窗口：只传递最近 30 轮的 toolResults
+    const RESULT_WINDOW = 30;   // 🔥 结果体完整保留最近 30 轮（更早的只留短摘要；条目本身不丢弃，保住缓存前缀）
     const NOTES_WINDOW = 50;    // 滑动窗口：只传递最近 50 轮的笔记摘要
 
     // 🔥 递归深度限制
@@ -274,8 +294,8 @@ export class ReActExecutor {
       throw new Error('执行被用户中断');
     }
 
-    // 🔥 滑动窗口：只传递最近 N 轮的数据给后端，节省 token
-    const windowedToolResults = toolResults.slice(-RESULT_WINDOW);
+    // 🔥 缓存友好：不丢弃旧轮条目，只裁剪旧轮结果体（见 trimToolResultsForPayload）
+    const windowedToolResults = trimToolResultsForPayload(toolResults, RESULT_WINDOW);
     const windowedWriteNotes = truncateWriteNotes(writeNotes, NOTES_WINDOW);
 
     const callId = `react-${sessionId}-${roundNumber}`;
@@ -364,6 +384,7 @@ export class ReActExecutor {
       toolResults.push({
         toolName: '_round_error',
         parameters: {},
+        roundNumber,
         result: {
           success: false,
           error: errorMsg,
@@ -431,6 +452,7 @@ export class ReActExecutor {
         toolResults.push({
           toolName: 'complete',
           parameters: {},
+          roundNumber,
           result: {
             success: true,
             data: { completeReport },
@@ -445,6 +467,7 @@ export class ReActExecutor {
       toolResults.push({
         toolName: '_no_action',
         parameters: {},
+        roundNumber,
         result: {
           success: true,
           data: { message: letMeDo },
@@ -572,6 +595,7 @@ export class ReActExecutor {
         {
           toolName,
           parameters,
+          roundNumber,
           result: toolResult,
         },
       ],

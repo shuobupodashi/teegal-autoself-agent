@@ -148,6 +148,99 @@ const fixOrphanedBlockMath = (text: string): string => {
   return output;
 };
 
+// 🔥 修复行内单 $ 定界符的过度配对（LaTeX 识别过度的兜底层）
+//
+// remark-math 会把任意两个 $ 之间的内容当行内公式。LLM 输出中的单 $
+// （shell 变量 $env:、$HOME，以及被 $..$ 包裹的代码常量如 $INJECT_OK$）
+// 会与远处下一个 $ 配对，把中间整段文本吞进公式——KaTeX 逐字符渲染，
+// 就是你看到的 I\nN\nJ\nE\nC\nT 竖排效果。
+//
+// 与 fixOrphanedBlockMath 同构的四步走：
+// 1. 保护代码块/行内代码/块级公式 $$..$$/已转义 \$
+// 2. 相邻配对单 $...$
+// 3. 校验内容是否真像行内公式（isLikelyInlineMath）
+// 4. 不像 → 该 $ 转义为 \$（remark-math 不再配对，原样显示）
+const isLikelyInlineMath = (content: string): boolean => {
+  const trimmed = content.trim();
+  if (!trimmed || trimmed.length > 120) return false;
+  if (/["']/.test(trimmed)) return false; // 引号 → 代码/文案
+  // CJK 与全角标点 → 对话文本，公式不会夹中文说明
+  if (/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u3000-\u303f\uff00-\uffef]/.test(trimmed)) return false;
+  // 代码风格常量排除：INJECT_OK / ARK_API_KEY / EXITCODE=0（全大写多字母 + 下划线/等号）
+  if (/\b[A-Z][A-Z0-9]{1,}_[A-Z0-9_]+\b/.test(trimmed)) return false;
+  if (/\b[A-Z]{3,}[A-Z0-9_]*\s*=[^=]/.test(trimmed)) return false;
+  // snake_case 代码标识符（user_id、max_tokens）；单字母主体不受影响（x_t、y_1 是数学下标）
+  if (/\b[a-z][a-z0-9]{1,}(?:_[a-z0-9]+)+\b/.test(trimmed)) return false;
+  // 代码占位符风格：ARK_{API}_{KEY}（大写主体 ≥2 字母 + 花括号下标）；单字母主体（V_{t}）是数学
+  if (/\b[A-Z][A-Z0-9]{1,}_{?[A-Za-z0-9]+\}/.test(trimmed)) return false;
+  // 必须有数学特征才配对
+  if (/\\[a-zA-Z]/.test(trimmed)) return true; // LaTeX 命令
+  if (/[_^{}]/.test(trimmed)) return true; // 上下标 / 花括号结构
+  if (/[\u0370-\u03ffΣ∑∫∏√±≈≠≤≥∈⊗⊙∇∂×⋅·÷]/.test(trimmed)) return true; // 希腊字母 / 数学符号
+  // 单变量等式（E=mc^2、x=1、λ=0.9）；多字母大写等式已被上面排除
+  if (/^[a-zA-Z](?:_[\w{}]+|\^\{?[\w{}]+})?\s*[=<>]\s*[-\w.]+$/.test(trimmed)) return true;
+  if (/^\d+(\.\d+)?\s*[+\-*/]\s*\d+(\.\d+)?$/.test(trimmed)) return true; // 简单算式
+  return false;
+};
+
+const fixOrphanedInlineMath = (text: string): string => {
+  const placeholders: string[] = [];
+  let phId = 0;
+  const protect = (content: string): string => {
+    placeholders.push(content);
+    return `\x00IM${phId++}\x00`;
+  };
+
+  // 保护代码块、行内代码、块级公式 $$...$$、已转义的 \$
+  let result = text
+    .replace(/```[\s\S]*?```/g, protect)
+    .replace(/`[^`]+`/g, protect)
+    .replace(/\$\$[\s\S]*?\$\$/g, protect)
+    .replace(/\\\$/g, protect);
+
+  // 找所有单 $ 位置
+  const positions: number[] = [];
+  let si = 0;
+  while ((si = result.indexOf('$', si)) !== -1) {
+    positions.push(si);
+    si += 1;
+  }
+
+  // 相邻配对 + 校验；通过则跳过一对，不通过则转义该 $（防止与远处配对吞文本）
+  const escapeSet = new Set<number>();
+  let i = 0;
+  while (i < positions.length) {
+    const j = i + 1;
+    if (j >= positions.length) {
+      escapeSet.add(i); // 落单的 $
+      break;
+    }
+    const content = result.substring(positions[i] + 1, positions[j]);
+    if (isLikelyInlineMath(content)) {
+      i = j + 1;
+    } else {
+      escapeSet.add(i);
+      i++;
+    }
+  }
+
+  // 从后往前转义，避免位置偏移
+  let output = result;
+  for (let k = positions.length - 1; k >= 0; k--) {
+    if (escapeSet.has(k)) {
+      const pos = positions[k];
+      output = output.substring(0, pos) + '\\$' + output.substring(pos + 1);
+    }
+  }
+
+  // 还原被保护的内容
+  output = output.replace(/\x00IM(\d+)\x00/g, (_, idx) => {
+    return placeholders[parseInt(idx)];
+  });
+
+  return output;
+};
+
 // 🔥 自定义 URL 链接转换：在渲染前将裸 URL 转换为 markdown 链接语法
 // 这样可以避免 remark-gfm 的 autolink 错误识别中文
 const preprocessUrls = (text: string): string => {
@@ -260,6 +353,11 @@ const preprocessBareMath = (text: string): string => {
     if (/:\/\//.test(run) || /[A-Za-z]:[\\/]/.test(run)) return true; // URL / 路径
     if (run.includes('$')) return true; // 残留 $ 定界符（交给 remark-math）
     if (run.length > 300) return true;
+    // 🔥 代码风格排除（与 isLikelyInlineMath 同款）：全大写下划线常量（INJECT_OK、ARK_API_KEY）、
+    // snake_case（credential_name）、大写等号常量（EXITCODE=0）——是代码输出/占位符，不是数学
+    if (/\b[A-Z][A-Z0-9]{1,}_[A-Z0-9_]+\b/.test(run)) return true;
+    if (/\b[a-z][a-z0-9]{1,}(?:_[a-z0-9]+)+\b/.test(run)) return true;
+    if (/\b[A-Z]{3,}[A-Z0-9_]*\s*=[^=]/.test(run)) return true;
     return false;
   };
 
@@ -343,12 +441,14 @@ const downgradeInlineDisplayMath = (text: string): string => {
 // 🔥 统一的消息文本预处理管道（content 和 result 共用，保证行为一致）
 const preprocessMessageText = (text: string): string => {
   return preprocessNumericRanges(
-    fixOrphanedBlockMath(
-      downgradeInlineDisplayMath(
-        preprocessBareMath(
-          preprocessLatexFormulas(
-            preprocessMarkdownTables(
-              preprocessUrls(text)
+    fixOrphanedInlineMath(
+      fixOrphanedBlockMath(
+        downgradeInlineDisplayMath(
+          preprocessBareMath(
+            preprocessLatexFormulas(
+              preprocessMarkdownTables(
+                preprocessUrls(text)
+              )
             )
           )
         )
