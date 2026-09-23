@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v1.3.62), must match package.json version'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ELECTRON_VERSION: 40.2.1
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve tag and version
+        id: meta
+        shell: bash
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          PKG=$(node -p "require('./package.json').version")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "package.json version = $PKG"
+          if [ "$PKG" != "$VERSION" ]; then
+            echo "::warning::tag $TAG != package.json version $PKG (updater compares package.json version)"
+          fi
+
+      - name: Create GitHub Release if missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --generate-notes
+
+      - name: Attach bootcode source snapshot
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          git archive --format=zip -o "bootcode-${VERSION}.zip" HEAD
+          gh release upload "$TAG" "bootcode-${VERSION}.zip" --clobber --repo "${{ github.repository }}"
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install local-backend dependencies
+        run: cd local-backend && npm ci
+
+      - name: Rebuild better-sqlite3 for Electron
+        run: |
+          cd local-backend/node_modules/better-sqlite3
+          npx prebuild-install --runtime=electron --target=${{ env.ELECTRON_VERSION }} --arch=x64 --force
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build local-backend
+        run: cd local-backend && npm run build
+
+      - name: Build electron bundles
+        run: npm run electron:build
+
+      - name: Package Windows installer (nsis)
+        run: npx electron-builder --win --publish never
+
+      - name: Upload Windows assets to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          ls -l release || true
+          for i in 1 2 3 4 5; do
+            if gh release upload "$TAG" release/*.exe release/latest.yml --clobber --repo "${{ github.repository }}"; then
+              exit 0
+            fi
+            echo "upload attempt $i failed, retrying"
+            sleep 15
+          done
+          exit 1
+
+  macos:
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install local-backend dependencies
+        run: cd local-backend && npm ci
+
+      - name: Rebuild better-sqlite3 for Electron
+        run: |
+          cd local-backend/node_modules/better-sqlite3
+          npx prebuild-install --runtime=electron --target=${{ env.ELECTRON_VERSION }} --arch=arm64 --force || npx prebuild-install --runtime=electron --target=${{ env.ELECTRON_VERSION }} --arch=x64 --force || npx --yes node-gyp rebuild --runtime=electron --target=${{ env.ELECTRON_VERSION }} --dist-url=https://electronjs.org/headers
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build local-backend
+        run: cd local-backend && npm run build
+
+      - name: Build electron bundles
+        run: npm run electron:build
+
+      - name: Package macOS dmg and zip
+        run: npx electron-builder --mac --publish never
+
+      - name: Upload macOS assets to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          ls -l release || true
+          for i in 1 2 3 4 5; do
+            if gh release upload "$TAG" release/*.dmg release/*.zip release/latest-mac.yml --clobber --repo "${{ github.repository }}"; then
+              exit 0
+            fi
+            echo "upload attempt $i failed, retrying"
+            sleep 15
+          done
+          exit 1
